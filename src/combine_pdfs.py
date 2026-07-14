@@ -1,5 +1,6 @@
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pypdf import PdfWriter
 
@@ -12,6 +13,19 @@ OUTPUT_FILE = OUTPUT_DIRECTORY / "combined_problems.pdf"
 
 
 def filename_from_url(problem_url):
+    hostname = (urlparse(problem_url).hostname or "").lower()
+
+    if hostname == "cses.fi" or hostname.endswith(".cses.fi"):
+        match = re.search(
+            r"/problemset/task/(\d+)",
+            problem_url
+        )
+
+        if match:
+            return f"cses_{match.group(1)}.pdf"
+
+        return None
+
     patterns = [
         r"/problemset/problem/(\d+)/([A-Za-z0-9]+)",
         r"/contest/(\d+)/problem/([A-Za-z0-9]+)",

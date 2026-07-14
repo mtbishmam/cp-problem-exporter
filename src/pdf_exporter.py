@@ -3,7 +3,7 @@ import asyncio
 import base64
 import re
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import async_playwright
 
@@ -11,13 +11,16 @@ from playwright.async_api import async_playwright
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_LINKS_FILE = ROOT_DIR / "input" / "links.txt"
 PDF_DIRECTORY = ROOT_DIR / "pdfs"
+
 CODEFORCES_BASE_URL = "https://codeforces.com"
+CSES_BASE_URL = "https://cses.fi"
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Export Codeforces problem statements as PDFs."
+            "Export Codeforces and CSES problem statements "
+            "as PDFs."
         )
     )
 
@@ -28,11 +31,11 @@ def build_parser():
 
     problem_parser = subparsers.add_parser(
         "problem",
-        help="Export one Codeforces problem URL."
+        help="Export one Codeforces or CSES problem URL."
     )
     problem_parser.add_argument(
         "url",
-        help="A Codeforces problem URL."
+        help="A Codeforces or CSES problem URL."
     )
 
     file_parser = subparsers.add_parser(
@@ -52,14 +55,34 @@ def build_parser():
 
     problemset_parser = subparsers.add_parser(
         "problemset",
-        help="Export all problems shown on a problemset page."
+        help=(
+            "Export every problem shown on a Codeforces "
+            "or CSES problemset page."
+        )
     )
     problemset_parser.add_argument(
         "url",
-        help="A Codeforces problemset page URL."
+        help="A Codeforces or CSES problemset page URL."
     )
 
     return parser
+
+
+def site_from_url(url):
+    hostname = (urlparse(url).hostname or "").lower()
+
+    if (
+        hostname == "codeforces.com"
+        or hostname.endswith(".codeforces.com")
+    ):
+        return "codeforces"
+
+    if hostname == "cses.fi" or hostname.endswith(".cses.fi"):
+        return "cses"
+
+    raise ValueError(
+        f"Unsupported site: {hostname or url}"
+    )
 
 
 def read_problem_urls(links_file):
@@ -87,6 +110,15 @@ def read_problem_urls(links_file):
                 )
                 continue
 
+            try:
+                site_from_url(url)
+            except ValueError as error:
+                print(
+                    f"Skipping URL on line {line_number}: "
+                    f"{error}"
+                )
+                continue
+
             if url not in seen:
                 seen.add(url)
                 problem_urls.append(url)
@@ -94,8 +126,19 @@ def read_problem_urls(links_file):
     return problem_urls
 
 
+async def verification_page_detected(page):
+    return (
+        "Just a moment..." in await page.title()
+        or await page.locator(
+            "text=Verify you are human"
+        ).count() > 0
+    )
+
+
 async def extract_problemset_urls(page, problemset_url):
-    print(f"Opening problemset: {problemset_url}")
+    site = site_from_url(problemset_url)
+
+    print(f"Opening {site} problemset: {problemset_url}")
 
     await page.goto(
         problemset_url,
@@ -103,24 +146,31 @@ async def extract_problemset_urls(page, problemset_url):
         timeout=30000
     )
 
-    print("Waiting 5 seconds for Cloudflare...")
-    await page.wait_for_timeout(5000)
+    if site == "codeforces":
+        print("Waiting 5 seconds for Cloudflare...")
+        await page.wait_for_timeout(5000)
 
-    if await verification_page_detected(page):
-        print("Verification page detected...")
-        print("Complete the verification in the browser.")
-        await page.wait_for_timeout(10000)
+        if await verification_page_detected(page):
+            print("Verification page detected...")
+            print("Complete the verification in the browser.")
+            await page.wait_for_timeout(10000)
 
-    await page.locator(
-        'table.problems a[href*="/problemset/problem/"]'
-    ).first.wait_for(
+        selector = (
+            'table.problems '
+            'a[href*="/problemset/problem/"]'
+        )
+        base_url = CODEFORCES_BASE_URL
+
+    else:
+        selector = 'a[href*="/problemset/task/"]'
+        base_url = CSES_BASE_URL
+
+    await page.locator(selector).first.wait_for(
         state="attached",
         timeout=30000
     )
 
-    hrefs = await page.locator(
-        'table.problems a[href*="/problemset/problem/"]'
-    ).evaluate_all(
+    hrefs = await page.locator(selector).evaluate_all(
         "elements => elements.map(element => element.href)"
     )
 
@@ -128,9 +178,20 @@ async def extract_problemset_urls(page, problemset_url):
     seen = set()
 
     for href in hrefs:
-        problem_url = urljoin(CODEFORCES_BASE_URL, href)
+        problem_url = urljoin(base_url, href)
 
-        if problem_url not in seen:
+        if site == "codeforces":
+            valid = re.search(
+                r"/problemset/problem/\d+/[A-Za-z0-9]+",
+                problem_url
+            )
+        else:
+            valid = re.search(
+                r"/problemset/task/\d+/?(?:[?#].*)?$",
+                problem_url
+            )
+
+        if valid and problem_url not in seen:
             seen.add(problem_url)
             problem_urls.append(problem_url)
 
@@ -138,6 +199,19 @@ async def extract_problemset_urls(page, problemset_url):
 
 
 def filename_from_url(problem_url, fallback_index):
+    site = site_from_url(problem_url)
+
+    if site == "cses":
+        match = re.search(
+            r"/problemset/task/(\d+)",
+            problem_url
+        )
+
+        if match:
+            return f"cses_{match.group(1)}.pdf"
+
+        return f"cses_problem_{fallback_index}.pdf"
+
     patterns = [
         r"/problemset/problem/(\d+)/([A-Za-z0-9]+)",
         r"/contest/(\d+)/problem/([A-Za-z0-9]+)",
@@ -153,19 +227,10 @@ def filename_from_url(problem_url, fallback_index):
             problem_index = match.group(2)
             return f"{contest_id}{problem_index}.pdf"
 
-    return f"problem_{fallback_index}.pdf"
+    return f"codeforces_problem_{fallback_index}.pdf"
 
 
-async def verification_page_detected(page):
-    return (
-        "Just a moment..." in await page.title()
-        or await page.locator(
-            "text=Verify you are human"
-        ).count() > 0
-    )
-
-
-async def prepare_statement_for_pdf(page):
+async def prepare_codeforces_statement(page):
     statement = page.locator(".problem-statement")
     await statement.wait_for(
         state="visible",
@@ -181,7 +246,7 @@ async def prepare_statement_for_pdf(page):
 
             if (!statement) {
                 throw new Error(
-                    'Problem statement was not found'
+                    'Codeforces problem statement was not found'
                 );
             }
 
@@ -282,6 +347,235 @@ async def prepare_statement_for_pdf(page):
         """
     )
 
+
+async def prepare_cses_statement(page):
+    statement = page.locator(".content > .md")
+    await statement.wait_for(
+        state="visible",
+        timeout=30000
+    )
+
+    await page.locator(
+        ".title-block > h1"
+    ).wait_for(
+        state="visible",
+        timeout=30000
+    )
+
+    await page.evaluate(
+        """
+        () => {
+            const title = document.querySelector(
+                '.title-block > h1'
+            );
+            const constraints = document.querySelector(
+                '.content > .task-constraints'
+            );
+            const statement = document.querySelector(
+                '.content > .md'
+            );
+
+            if (!title || !statement) {
+                throw new Error(
+                    'CSES problem statement was not found'
+                );
+            }
+
+            /*
+             * CSES places sample labels and pre blocks one
+             * after another. Wrap each input/output pair so
+             * CSS can display it in two columns.
+             */
+            const exampleHeadings = Array.from(
+                statement.querySelectorAll('h1')
+            ).filter(heading =>
+                (heading.id || '')
+                    .toLowerCase()
+                    .startsWith('example')
+                || heading.textContent
+                    .trim()
+                    .toLowerCase()
+                    .startsWith('example')
+            );
+
+            exampleHeadings.forEach(heading => {
+                const sectionElements = [];
+                let current = heading.nextElementSibling;
+
+                while (current && current.tagName !== 'H1') {
+                    sectionElements.push(current);
+                    current = current.nextElementSibling;
+                }
+
+                const inputLabel = sectionElements.find(
+                    element =>
+                        element.tagName === 'P'
+                        && /^input\\s*:?$/i.test(
+                            element.textContent.trim()
+                        )
+                );
+
+                const outputLabel = sectionElements.find(
+                    element =>
+                        element.tagName === 'P'
+                        && /^output\\s*:?$/i.test(
+                            element.textContent.trim()
+                        )
+                );
+
+                const inputPre = inputLabel
+                    && inputLabel.nextElementSibling
+                    && inputLabel.nextElementSibling.tagName
+                        === 'PRE'
+                    ? inputLabel.nextElementSibling
+                    : null;
+
+                const outputPre = outputLabel
+                    && outputLabel.nextElementSibling
+                    && outputLabel.nextElementSibling.tagName
+                        === 'PRE'
+                    ? outputLabel.nextElementSibling
+                    : null;
+
+                if (
+                    !inputLabel
+                    || !inputPre
+                    || !outputLabel
+                    || !outputPre
+                ) {
+                    return;
+                }
+
+                inputLabel.textContent = 'Input';
+                outputLabel.textContent = 'Output';
+
+                const grid = document.createElement('div');
+                grid.className = 'cses-sample-grid';
+
+                const inputBlock = document.createElement('div');
+                inputBlock.className = 'cses-sample-block';
+                inputBlock.append(inputLabel, inputPre);
+
+                const outputBlock = document.createElement('div');
+                outputBlock.className = 'cses-sample-block';
+                outputBlock.append(outputLabel, outputPre);
+
+                grid.append(inputBlock, outputBlock);
+                heading.insertAdjacentElement('afterend', grid);
+            });
+
+            const wrapper = document.createElement('main');
+            wrapper.className = 'cses-problem-statement';
+
+            wrapper.appendChild(title);
+
+            if (constraints) {
+                wrapper.appendChild(constraints);
+            }
+
+            wrapper.appendChild(statement);
+            document.body.replaceChildren(wrapper);
+
+            document.documentElement.style.background = 'white';
+            document.body.style.margin = '20px';
+            document.body.style.background = 'white';
+        }
+        """
+    )
+
+    await page.add_style_tag(
+        content="""
+        @page {
+            size: A4;
+            margin: 12mm;
+        }
+
+        body {
+            color: black;
+            font-family: serif;
+            font-size: 12pt;
+        }
+
+        .cses-problem-statement {
+            width: 100%;
+            max-width: none;
+        }
+
+        .cses-problem-statement > h1 {
+            margin: 0 0 8px;
+            font-size: 22pt;
+            text-align: center;
+        }
+
+        .task-constraints {
+            display: flex;
+            justify-content: center;
+            gap: 24px;
+            margin: 0 0 16px;
+            padding: 0;
+            list-style: none;
+        }
+
+        .md h1 {
+            margin: 16px 0 6px;
+            font-size: 15pt;
+        }
+
+        .md p {
+            margin: 6px 0;
+        }
+
+        img {
+            max-width: 100%;
+        }
+
+        pre {
+            white-space: pre-wrap !important;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+
+        .cses-sample-grid {
+            display: grid;
+            grid-template-columns:
+                minmax(0, 1fr)
+                minmax(0, 1fr);
+            gap: 10px;
+            align-items: start;
+            margin-bottom: 10px;
+            break-inside: avoid;
+        }
+
+        .cses-sample-block {
+            min-width: 0;
+        }
+
+        .cses-sample-block > p {
+            margin: 0 !important;
+            border: 1px solid #999;
+            border-bottom: 0;
+            padding: 4px 6px;
+            font-weight: bold;
+        }
+
+        .cses-sample-block > pre {
+            box-sizing: border-box;
+            min-height: 42px;
+            margin: 0 !important;
+            border: 1px solid #999;
+            padding: 6px;
+            font-size: 10pt !important;
+        }
+        """
+    )
+
+
+async def prepare_statement_for_pdf(page, site):
+    if site == "codeforces":
+        await prepare_codeforces_statement(page)
+    else:
+        await prepare_cses_statement(page)
+
     await page.emulate_media(media="print")
 
 
@@ -319,28 +613,32 @@ async def download_problem(
     position,
     total
 ):
-    filename = filename_from_url(
-        problem_url,
-        position
-    )
-    pdf_path = PDF_DIRECTORY / filename
-
     print(f"[{position}/{total}] {problem_url}")
 
     try:
+        site = site_from_url(problem_url)
+        filename = filename_from_url(
+            problem_url,
+            position
+        )
+        pdf_path = PDF_DIRECTORY / filename
+
         await page.goto(
             problem_url,
             wait_until="load",
             timeout=30000
         )
 
-        if await verification_page_detected(page):
+        if (
+            site == "codeforces"
+            and await verification_page_detected(page)
+        ):
             print("    Verification page detected...")
             print("    Complete it in the browser if needed.")
             await page.wait_for_timeout(10000)
 
         await page.wait_for_timeout(2000)
-        await prepare_statement_for_pdf(page)
+        await prepare_statement_for_pdf(page, site)
         await save_page_as_pdf(page, context, pdf_path)
 
         print(f"    Saved: {filename}")
@@ -405,7 +703,7 @@ async def export_pdfs(args):
                 )
 
             if not problem_urls:
-                print("No problem links were found.")
+                print("No supported problem links were found.")
                 return
 
             print(f"Found {len(problem_urls)} problems.\n")
@@ -424,7 +722,7 @@ async def export_pdfs(args):
 
                 await page.wait_for_timeout(2000)
 
-        except FileNotFoundError as error:
+        except (FileNotFoundError, ValueError) as error:
             print(error)
 
         except Exception as error:
